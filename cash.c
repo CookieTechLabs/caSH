@@ -1,4 +1,3 @@
-
 #define _POSIX_C_SOURCE 200809L
 
 #include <stdio.h>
@@ -271,7 +270,7 @@ static int tokenize(const char *input, TokenList *list)
             continue;
         }
 
-        if (c == '|' ) {
+        if (c == '|') {
             token_add(list, TOK_PIPE, "|");
             i++;
             continue;
@@ -415,6 +414,10 @@ typedef struct {
     size_t argc;
     size_t capacity;
 
+    char **assignments;
+    size_t assignment_count;
+    size_t assignment_capacity;
+
     char **redirs;
     int *redir_types;
     size_t redir_count;
@@ -484,6 +487,65 @@ static Command *command_new(void)
     return cmd;
 }
 
+static bool is_assignment_word(const char *word)
+{
+    const char *equals = strchr(word, '=');
+
+    if (!equals || equals == word)
+        return false;
+
+    if (!(isalpha((unsigned char)word[0]) || word[0] == '_'))
+        return false;
+
+    for (const char *p = word + 1; p < equals; p++) {
+        if (!(isalnum((unsigned char)*p) || *p == '_'))
+            return false;
+    }
+
+    return true;
+}
+
+static void command_add_assignment(Command *cmd, const char *assignment)
+{
+    if (cmd->assignment_count == cmd->assignment_capacity) {
+        cmd->assignment_capacity = cmd->assignment_capacity ?
+                                   cmd->assignment_capacity * 2 : 4;
+
+        cmd->assignments = cash_realloc(
+            cmd->assignments,
+            cmd->assignment_capacity * sizeof(char *)
+        );
+    }
+
+    cmd->assignments[cmd->assignment_count++] = cash_strdup(assignment);
+}
+
+static int apply_assignments(Command *cmd)
+{
+    for (size_t i = 0; i < cmd->assignment_count; i++) {
+        char *assignment = cash_strdup(cmd->assignments[i]);
+        char *equals = strchr(assignment, '=');
+
+        if (!equals) {
+            free(assignment);
+            continue;
+        }
+
+        *equals++ = '\0';
+
+        if (setenv(assignment, equals, 1) < 0) {
+            fprintf(stderr, "cash: %s: %s\n",
+                    assignment, strerror(errno));
+            free(assignment);
+            return -1;
+        }
+
+        free(assignment);
+    }
+
+    return 0;
+}
+
 static void command_add_arg(Command *cmd, const char *arg)
 {
     if (cmd->argc >= CASH_MAX_ARGS) {
@@ -535,10 +597,14 @@ static void command_free(Command *cmd)
     for (size_t i = 0; i < cmd->argc; i++)
         free(cmd->argv[i]);
 
+    for (size_t i = 0; i < cmd->assignment_count; i++)
+        free(cmd->assignments[i]);
+
     for (size_t i = 0; i < cmd->redir_count; i++)
         free(cmd->redirs[i]);
 
     free(cmd->argv);
+    free(cmd->assignments);
     free(cmd->redirs);
     free(cmd->redir_types);
     free(cmd);
@@ -596,7 +662,13 @@ static Pipeline *parse_pipeline(Parser *parser)
             TokenType type = peek(parser)->type;
 
             if (type == TOK_WORD) {
-                command_add_arg(cmd, consume(parser)->text);
+                const char *word = consume(parser)->text;
+
+                if (!cmd->argc && is_assignment_word(word))
+                    command_add_assignment(cmd, word);
+                else
+                    command_add_arg(cmd, word);
+
                 continue;
             }
 
@@ -629,7 +701,9 @@ static Pipeline *parse_pipeline(Parser *parser)
             command_add_redir(cmd, redir_type, path);
         }
 
-        if (!cmd->argc && !cmd->redir_count) {
+        if (!cmd->argc &&
+            !cmd->assignment_count &&
+            !cmd->redir_count) {
             command_free(cmd);
 
             if (!pipeline->count) {
@@ -1000,6 +1074,9 @@ static int execute_child_command(Command *cmd)
     if (apply_redirections(cmd) < 0)
         return 1;
 
+    if (apply_assignments(cmd) < 0)
+        return 1;
+
     if (!cmd->argc)
         return 0;
 
@@ -1011,7 +1088,18 @@ static int execute_child_command(Command *cmd)
 
 static int execute_single(Command *cmd)
 {
+    if (!cmd->argc && cmd->assignment_count) {
+        if (apply_assignments(cmd) < 0)
+            return 1;
+
+        if (!cmd->redir_count)
+            return 0;
+    }
+
     if (cmd->argc && is_shell_command(cmd->argv[0])) {
+        if (apply_assignments(cmd) < 0)
+            return 1;
+
         int saved_stdin = dup(STDIN_FILENO);
         int saved_stdout = dup(STDOUT_FILENO);
         int saved_stderr = dup(STDERR_FILENO);
