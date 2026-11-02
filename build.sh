@@ -1,0 +1,1 @@
+cc -std=c11 -Wall -Wextra -Wpedantic cash.c -o cash
